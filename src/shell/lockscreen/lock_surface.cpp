@@ -52,6 +52,17 @@ namespace {
   constexpr int kForecastDayCountAlone = 5;
   constexpr float kWeatherCurrentMinText = 56.0F;
 
+  // Two-click confirmation window for destructive lock-screen session actions
+  // (logout / reboot / shutdown / custom commands). Suspend is excluded — it
+  // resumes with the session intact — and "lock"/"lock_and_suspend" never
+  // reach the lock screen (resolveSessionActions filters them out).
+  constexpr auto kSessionConfirmWindow = std::chrono::milliseconds{5000};
+  constexpr auto kSessionConfirmTick = std::chrono::milliseconds{100};
+
+  [[nodiscard]] bool needsLockscreenConfirm(std::string_view action) {
+    return action == "logout" || action == "reboot" || action == "shutdown" || action == "command";
+  }
+
   [[nodiscard]] int fitForecastDays(
       Renderer& renderer, float weatherBudget, float weatherGlyphSize, float forecastGlyphSize, float captionSize,
       int maxDays
@@ -629,6 +640,8 @@ void LockSurface::setLockedState(bool locked) {
     return;
   }
   m_locked = locked;
+  // Never carry an armed confirm across lock cycles.
+  disarmSessionAction();
   if (m_locked) {
     focusPasswordField();
   } else {
@@ -1386,6 +1399,8 @@ void LockSurface::rebuildSessionButtons() {
     return;
   }
   m_lastSessionActionKeys = std::move(keys);
+  // Buttons are about to be rebuilt; any armed confirm refers to stale buttons.
+  disarmSessionAction();
 
   while (!m_sessionRow->children().empty()) {
     m_sessionRow->removeChild(m_sessionRow->children().front().get());
@@ -1396,7 +1411,8 @@ void LockSurface::rebuildSessionButtons() {
     return;
   }
 
-  for (const auto& cfg : actions) {
+  for (std::size_t index = 0; index < actions.size(); ++index) {
+    const auto& cfg = actions[index];
     const std::string labelText =
         cfg.label.has_value() && !cfg.label->empty() ? *cfg.label : i18n::tr(session_action::labelKey(cfg.action));
     auto button = ui::button({
@@ -1415,10 +1431,8 @@ void LockSurface::rebuildSessionButtons() {
         .radius = Style::scaledRadiusMd(),
         .flexGrow = 1.0F,
         .onClick =
-            [this, cfg]() {
-              if (m_sessionActions != nullptr) {
-                m_sessionActions->invoke(cfg);
-              }
+            [this, cfg, index]() {
+              activateSessionAction(cfg, index);
             },
         .configure =
             [](Button& control) {
@@ -1431,6 +1445,94 @@ void LockSurface::rebuildSessionButtons() {
     m_sessionButtons.push_back(button.get());
     m_sessionRow->addChild(std::move(button));
   }
+}
+
+void LockSurface::activateSessionAction(const SessionPanelActionConfig& cfg, std::size_t index) {
+  if (!needsLockscreenConfirm(cfg.action)) {
+    disarmSessionAction();
+    if (m_sessionActions != nullptr) {
+      m_sessionActions->invoke(cfg);
+    }
+    return;
+  }
+
+  if (m_armedSessionAction.has_value() && m_armedSessionAction->index == index
+      && m_armedSessionAction->cfg.action == cfg.action) {
+    // Second click on the armed button confirms.
+    disarmSessionAction();
+    if (m_sessionActions != nullptr) {
+      m_sessionActions->invoke(cfg);
+    }
+    return;
+  }
+
+  armSessionAction(cfg, index);
+}
+
+void LockSurface::armSessionAction(const SessionPanelActionConfig& cfg, std::size_t index) {
+  disarmSessionAction();
+  if (index >= m_sessionButtons.size() || m_sessionButtons[index] == nullptr) {
+    return;
+  }
+  std::string label = cfg.label.value_or("");
+  if (label.empty()) {
+    label = i18n::tr(session_action::labelKey(cfg.action));
+  }
+  m_armedSessionAction = ArmedSessionAction{
+      .index = index,
+      .remaining = kSessionConfirmWindow,
+      .label = std::move(label),
+      .cfg = cfg,
+  };
+  m_sessionConfirmTimer.startRepeating(kSessionConfirmTick, [this]() { tickSessionConfirm(); });
+  updateArmedSessionVisuals();
+  requestUpdate();
+}
+
+void LockSurface::disarmSessionAction() {
+  m_sessionConfirmTimer.stop();
+  if (!m_armedSessionAction.has_value()) {
+    return;
+  }
+  const ArmedSessionAction armed = std::move(*m_armedSessionAction);
+  m_armedSessionAction.reset();
+  if (armed.index < m_sessionButtons.size()) {
+    if (Button* button = m_sessionButtons[armed.index]; button != nullptr) {
+      button->setVariant(lockscreenSessionVariant(armed.cfg.variant));
+      button->setBadge("");
+    }
+  }
+  requestUpdate();
+}
+
+void LockSurface::updateArmedSessionVisuals() {
+  if (!m_armedSessionAction.has_value()) {
+    return;
+  }
+  const std::size_t index = m_armedSessionAction->index;
+  if (index >= m_sessionButtons.size() || m_sessionButtons[index] == nullptr) {
+    return;
+  }
+  Button* button = m_sessionButtons[index];
+  const std::int64_t ms = m_armedSessionAction->remaining.count();
+  const auto seconds = static_cast<std::int64_t>(std::max<std::int64_t>(1, (ms + 999) / 1000));
+  button->setVariant(ButtonVariant::Destructive);
+  button->setBadge(std::format("{}s", seconds));
+}
+
+void LockSurface::tickSessionConfirm() {
+  if (!m_armedSessionAction.has_value()) {
+    m_sessionConfirmTimer.stop();
+    return;
+  }
+  m_armedSessionAction->remaining -= kSessionConfirmTick;
+  if (m_armedSessionAction->remaining <= std::chrono::milliseconds{0}) {
+    // Expiry only cancels — a confirm gate must never fire the action itself.
+    disarmSessionAction();
+    return;
+  }
+  updateArmedSessionVisuals();
+  requestUpdate();
 }
 
 void LockSurface::syncRegularExtras(Renderer& renderer) {
@@ -1596,6 +1698,11 @@ bool LockSurface::isLoginBoxEnabled() const {
 
 std::string LockSurface::resolveStatusText(const lockscreen_login_box::LoginBoxStyle& style, bool& isError) const {
   isError = false;
+  // While a destructive action is armed, the confirm instruction outranks
+  // every other status (auth errors clear on the next keystroke anyway).
+  if (m_armedSessionAction.has_value()) {
+    return i18n::tr("lockscreen.confirm-action", "action", m_armedSessionAction->label);
+  }
   // Errors always show. Caps Lock has its own toggle. Everything else (idle hint,
   // authenticating, PAM prompts) is gated by showUnlockHint.
   if (m_error) {

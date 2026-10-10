@@ -728,6 +728,7 @@
     "authenticating": "Authenticating…",
     "authentication-failed": "Authentication failed",
     "caps-lock-on": "Caps Lock is on",
+    "confirm-action": "Click {action} again to confirm",
     "password-cleared": "Password cleared",
     "password-placeholder": "Password",
     "ready": "Type your password and press Enter.",

@@ -2,6 +2,7 @@
 
 #include "capture/screencopy_capture.h"
 #include "config/config_service.h"
+#include "core/timer_manager.h"
 #include "render/animation/animation_manager.h"
 #include "render/core/blur_cache.h"
 #include "render/core/color.h"
@@ -12,6 +13,7 @@
 #include "wayland/surface.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -111,6 +113,11 @@ private:
   void updateCopy();
   void syncRegularExtras(Renderer& renderer);
   void rebuildSessionButtons();
+  void activateSessionAction(const SessionPanelActionConfig& cfg, std::size_t index);
+  void armSessionAction(const SessionPanelActionConfig& cfg, std::size_t index);
+  void disarmSessionAction();
+  void updateArmedSessionVisuals();
+  void tickSessionConfirm();
   void ensureLayoutChipInPasswordRow();
   [[nodiscard]] std::vector<SessionPanelActionConfig> resolveSessionActions() const;
   [[nodiscard]] lockscreen_login_box::LoginBoxStyle resolveLoginStyle() const;
@@ -203,4 +210,19 @@ private:
   std::string m_lastMediaArtist;
   std::string m_lastWeatherFingerprint;
   std::vector<std::string> m_lastSessionActionKeys;
+
+  // Two-click confirmation for destructive session actions (logout / reboot /
+  // shutdown / custom commands): the first click arms the button for a short
+  // window; only a second click on the same armed button runs the action.
+  // Expiry disarms silently — the countdown itself never executes anything
+  // (unlike the session panel's countdown_seconds, which fires on expiry).
+  struct ArmedSessionAction {
+    std::size_t index = 0;
+    std::chrono::milliseconds remaining{};
+    std::string label;
+    SessionPanelActionConfig cfg;
+  };
+  std::optional<ArmedSessionAction> m_armedSessionAction;
+  // Declared after the scene so it is destroyed (and stopped) before it.
+  Timer m_sessionConfirmTimer;
 };
